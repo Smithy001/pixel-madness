@@ -6,6 +6,10 @@ import math
 import time
 import pickle
 import sys
+from http.server import SimpleHTTPRequestHandler
+import socketserver
+import threading
+import os
 
 # Game settings
 WORLD_SIZE = 2000
@@ -78,7 +82,7 @@ def generate_ai_player():
         'target': None,
         'online': True,
         'is_ai': True,
-        'max_speed': 3.0,   # Parameter for max speed
+        'max_speed': 10.0,   # Parameter for max speed
         'agility': 0.3,     # Parameter for how quickly the player can change velocity
         'health': 10
     }
@@ -117,10 +121,16 @@ async def register_player(websocket):
 async def unregister_player(websocket):
     if websocket in websockets_map:
         name = websockets_map[websocket]
-        player = players[name]
-        player['online'] = False
-        print(f"{name} has disconnected.")
+        if name in players:
+            player = players[name]
+            player['online'] = False
+            print(f"{name} has disconnected.")
+
+        # Remove the mapping for the websocket
         del websockets_map[websocket]
+    else:
+        print("Attempted to unregister a websocket that was not registered.")
+
 
 async def game_handler(websocket):
     await register_player(websocket)
@@ -264,100 +274,107 @@ def handle_world_bounds(player):
 
 def update_ai_players():
     for ai in ai_players:
-        # Remove old target logic
-        # No more ai['target_food'] or ai['target']
+        # Clear old logic and re-implement with a stronger priority on food avoidance
         
-        # Step 1: Avoid active food
-        avoidance_dx = 0.0
-        avoidance_dy = 0.0
+        max_avoid_influence = 250.0
+        close_food_threshold = 100.0  # If food is very close, prioritize escaping
+        avoidance_x = 0.0
+        avoidance_y = 0.0
+        closest_food_dist = float('inf')
+
+        # 1. Stronger priority for avoiding food:
         for f in food_items:
             if f.get('active', False) and f['owner'] != ai['name']:
                 dx = f['x'] - ai['x']
                 dy = f['y'] - ai['y']
                 dist_sq = dx*dx + dy*dy
-                if dist_sq < (150**2):  # If active food is within 150 units, try to avoid it
+                if dist_sq < (max_avoid_influence**2):
                     dist = math.sqrt(dist_sq) + 1e-6
-                    # Steer away from food
-                    avoidance_dx -= (dx/dist)*1.0
-                    avoidance_dy -= (dy/dist)*1.0
+                    if dist < closest_food_dist:
+                        closest_food_dist = dist
+                    # Weight avoidance more strongly as food gets closer
+                    # Increase the weight drastically to ensure avoiding food is top priority
+                    weight = (max_avoid_influence/dist)**2  # stronger weight
+                    avoidance_x -= (dx/dist)*weight
+                    avoidance_y -= (dy/dist)*weight
 
-        # Step 2: Use spawned food as a weapon.
-        # To use food as a weapon, position so that another player is behind them.
-        # We'll pick the closest other player and try to orient so that player is behind the AI.
-        # "Behind" means we want to face away from that player.
-        
-        # Find another player to orient against
-        target_player = None
-        closest_dist = float('inf')
-        all_entities = [p for p in players.values() if p.get('online',False) and p['name'] != ai['name']] + [a for a in ai_players if a['name'] != ai['name']]
-        for ent in all_entities:
-            dx = ent['x'] - ai['x']
-            dy = ent['y'] - ai['y']
-            dist_sq = dx*dx + dy*dy
-            if dist_sq < closest_dist:
-                closest_dist = dist_sq
-                target_player = ent
-
-        desired_vx = 0.0
-        desired_vy = 0.0
-
-        if target_player:
-            # We want target_player to be behind us. 
-            # Let's define "behind" as the direction opposite to our velocity.
-            # If we have no velocity, pick a random direction.
-            if ai.get('vx',0) == 0 and ai.get('vy',0) == 0:
-                # If standing still, pick a random initial direction
-                angle = random.uniform(0, 2*math.pi)
-                ai['vx'] = math.cos(angle)*0.1
-                ai['vy'] = math.sin(angle)*0.1
-            
-            # Check angle between AI->target vector and AI's velocity
-            dx = target_player['x'] - ai['x']
-            dy = target_player['y'] - ai['y']
-            dist = math.hypot(dx,dy)+1e-6
-
-            # Unit vector towards target
-            ux = dx/dist
-            uy = dy/dist
-
-            # AI's current velocity direction
-            speed = math.hypot(ai.get('vx',0), ai.get('vy',0))+1e-6
-            vx_norm = ai.get('vx',0)/speed
-            vy_norm = ai.get('vy',0)/speed
-
-            # We want the target to be behind us, so we want to face AWAY from the target
-            # That means we want our velocity direction to be opposite of (ux, uy)
-            # So desired velocity direction = -ux, -uy
-            desired_vx = -ux * ai['max_speed']
-            desired_vy = -uy * ai['max_speed']
+        # If any food is extremely close, ignore offensive moves and just run away:
+        if closest_food_dist < close_food_threshold:
+            # Pure avoidance mode: Just turn avoidance vector into desired velocity
+            desired_vx = avoidance_x
+            desired_vy = avoidance_y
         else:
-            # No target player: just roam slowly or stand still
-            desired_vx = ai.get('vx',0)*0.9
-            desired_vy = ai.get('vy',0)*0.9
+            # 2. Offensive positioning:
+            # After dealing with avoidance, we still try to orient so that other players end up behind us.
 
-        # Incorporate avoidance from food
-        # Just add the avoidance vector to desired velocity direction before steer
-        if avoidance_dx != 0 or avoidance_dy != 0:
-            # Normalize avoidance
-            avoid_dist = math.hypot(avoidance_dx, avoidance_dy)+1e-6
-            avoidance_dx = (avoidance_dx/avoid_dist) * ai['max_speed']
-            avoidance_dy = (avoidance_dy/avoid_dist) * ai['max_speed']
-            # Blend with desired velocity
-            desired_vx += avoidance_dx
-            desired_vy += avoidance_dy
+            target_player = None
+            best_score = float('inf')
+            all_entities = [p for p in players.values() if p.get('online',False) and p['health'] > 0 and p['name'] != ai['name']] \
+                         + [a for a in ai_players if a['name'] != ai['name'] and a['health'] > 0]
 
-        # Now steer towards desired velocity
-        steer_x = desired_vx - ai.get('vx',0)
-        steer_y = desired_vy - ai.get('vy',0)
+            for ent in all_entities:
+                dx = ent['x'] - ai['x']
+                dy = ent['y'] - ai['y']
+                dist = math.hypot(dx, dy)+1e-6
+                speed = math.hypot(ai.get('vx',0), ai.get('vy',0))+1e-6
+                vx_norm = ai.get('vx',0)/speed
+                vy_norm = ai.get('vy',0)/speed
+                ux = dx/dist
+                uy = dy/dist
+                dot = ux*vx_norm + uy*vy_norm
+                # Favor targets behind us (dot < 0) and closer
+                score = dist*(1 - dot)
+                if score < best_score:
+                    best_score = score
+                    target_player = ent
 
+            if target_player:
+                # If we have a target, we want them behind us
+                dx = target_player['x'] - ai['x']
+                dy = target_player['y'] - ai['y']
+                dist = math.hypot(dx,dy)+1e-6
+                ux = dx/dist
+                uy = dy/dist
+                # Velocity direction:
+                speed = math.hypot(ai.get('vx',0), ai.get('vy',0))+1e-6
+                if speed < 0.01:
+                    angle = random.uniform(0, 2*math.pi)
+                    ai['vx'] = math.cos(angle)*0.1
+                    ai['vy'] = math.sin(angle)*0.1
+                    speed = 0.1
+
+                # Face away from target
+                desired_vx = -ux * ai['max_speed']
+                desired_vy = -uy * ai['max_speed']
+            else:
+                # No target player: just random roaming
+                wander_angle = random.uniform(0, 2*math.pi)
+                wander_strength = 0.2
+                desired_vx = ai.get('vx',0)*0.9 + math.cos(wander_angle)*wander_strength
+                desired_vy = ai.get('vy',0)*0.9 + math.sin(wander_angle)*wander_strength
+
+            # Add avoidance to desired velocity (since avoidance is top priority)
+            if avoidance_x != 0 or avoidance_y != 0:
+                # Normalize avoidance and add strongly
+                avoid_dist = math.hypot(avoidance_x, avoidance_y)+1e-6
+                avoidance_x = (avoidance_x/avoid_dist)*ai['max_speed']*2.0  # Double to emphasize avoidance
+                avoidance_y = (avoidance_y/avoid_dist)*ai['max_speed']*2.0
+                desired_vx += avoidance_x
+                desired_vy += avoidance_y
+
+        # Steer towards desired velocity:
+        vx = ai.get('vx',0)
+        vy = ai.get('vy',0)
+        steer_x = desired_vx - vx
+        steer_y = desired_vy - vy
         steer_magnitude = math.hypot(steer_x, steer_y)
         if steer_magnitude > ai['agility']:
-            scale = ai['agility'] / steer_magnitude
+            scale = ai['agility']/steer_magnitude
             steer_x *= scale
             steer_y *= scale
 
-        ai['vx'] = ai.get('vx',0) + steer_x
-        ai['vy'] = ai.get('vy',0) + steer_y
+        ai['vx'] = vx + steer_x
+        ai['vy'] = vy + steer_y
 
         new_x = ai['x'] + ai['vx']
         new_y = ai['y'] + ai['vy']
@@ -368,7 +385,6 @@ def update_ai_players():
         else:
             ai['x'] = new_x % WORLD_SIZE
             ai['y'] = new_y % WORLD_SIZE
-
 
 def update_food_positions():
     global lastFoodSpawnTime
@@ -383,57 +399,72 @@ def update_food_positions():
                 # Inactive foods do not move or interact
                 continue
 
-        # If active, track closest player except the owner
+        # If active, track the closest player except the owner
         owner = food['owner']
         closest_dist = float('inf')
         target_player = None
-        # Find closest player/ai who is not the owner
+
+        # Find the closest player/AI who is not the owner
         for ent in list(players.values()) + ai_players:
-            if not ent['online'] and not ent.get('is_ai',False):
+            if not ent.get('online', False) or ent['health'] <= 0:
                 continue
             if ent['name'] == owner:
                 continue
-            dx = ent['x'] - food['x']
-            dy = ent['y'] - food['y']
-            dist_sq = dx*dx + dy*dy
+            # Compute direct and wrapped differences to handle wrapping
+            def wrapped_delta(a, b, world_size):
+                direct = b - a
+                wrapped_up = direct + world_size
+                wrapped_down = direct - world_size
+                # Choose the delta with the smallest absolute value
+                return min((direct, wrapped_up, wrapped_down), key=abs)
+
+            dx_raw = ent['x'] - food['x']
+            dy_raw = ent['y'] - food['y']
+
+            # Adjust for wrapping on x and y
+            dx = wrapped_delta(food['x'], ent['x'], WORLD_SIZE)
+            dy = wrapped_delta(food['y'], ent['y'], WORLD_SIZE)
+
+            dist_sq = dx * dx + dy * dy
             if dist_sq < closest_dist:
                 closest_dist = dist_sq
                 target_player = ent
 
         if target_player:
-            dist = math.sqrt(closest_dist)+1e-6
-            speed = 8  # Food move speed
-            dir_x = (target_player['x'] - food['x']) / dist
-            dir_y = (target_player['y'] - food['y']) / dist
-            new_x = food['x'] + dir_x * speed
-            new_y = food['y'] + dir_y * speed
-            # Wrap coordinates
-            food['x'] = new_x % WORLD_SIZE
-            food['y'] = new_y % WORLD_SIZE
+            # Smoothly move towards the target player with wrap-aware deltas
+            dx = wrapped_delta(food['x'], target_player['x'], WORLD_SIZE)
+            dy = wrapped_delta(food['y'], target_player['y'], WORLD_SIZE)
+            dist = math.sqrt(dx * dx + dy * dy) + 1e-6
+            speed = 80
+            dir_x = dx / dist
+            dir_y = dy / dist
+            smoothing_factor = 0.9
+
+            old_x = food['x']
+            old_y = food['y']
+
+            food['x'] = (old_x * smoothing_factor + (old_x + dir_x * speed) * (1 - smoothing_factor)) % WORLD_SIZE
+            food['y'] = (old_y * smoothing_factor + (old_y + dir_y * speed) * (1 - smoothing_factor)) % WORLD_SIZE
+        else:
+            # If no target, wander slowly to reduce jitter
+            food['x'] = (food['x'] + random.uniform(-1, 1)) % WORLD_SIZE
+            food['y'] = (food['y'] + random.uniform(-1, 1)) % WORLD_SIZE
 
     # In game_state_sender(), spawn 2 foods every 0.5s behind random players or ai:
-    # After:
-    # current_time = time.time()
-    # time_since_last_save = current_time - lastSaveTime
-    # Insert:
     spawn_time_diff = current_time - lastFoodSpawnTime
     if spawn_time_diff > 0.2:  # 2 per second
-        # Collect all entities (players + ai) that are online
         all_entities = [p for p in players.values() if p.get('online',False)] + ai_players
 
         for ent in all_entities:
             vx = ent.get('vx',0)
             vy = ent.get('vy',0)
             angle = math.atan2(vy,vx) if (vx!=0 or vy!=0) else 0.0
-            # Spawn behind: opposite direction of angle
             behind_dist = 50
             behind_x = ent['x'] - math.cos(angle)*behind_dist
             behind_y = ent['y'] - math.sin(angle)*behind_dist
-            # Wrap coordinates
             behind_x = behind_x % WORLD_SIZE
             behind_y = behind_y % WORLD_SIZE
 
-            # Create inactive food
             new_food = {
                 'x': behind_x,
                 'y': behind_y,
@@ -444,6 +475,7 @@ def update_food_positions():
             food_items.append(new_food)
 
         lastFoodSpawnTime = current_time
+
         
 
 def create_explosion(fireball):
@@ -646,7 +678,18 @@ async def game_state_sender():
             quit()
         await asyncio.sleep(0.05)
 
+class PublicHTTPRequestHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory="./public", **kwargs)
+
+def start_http_server():
+    PORT = int(os.getenv("HTTP_PORT", 8080))
+    http_server = socketserver.TCPServer(("", PORT), PublicHTTPRequestHandler)
+    print(f"HTTP server running on http://localhost:{PORT}")
+    http_server.serve_forever()
+
 async def main():
+    PORT = int(os.getenv("WS_PORT", 6789))
     if '-reset' not in sys.argv:
         print('Loading saved world')
         load_game_state()
@@ -655,9 +698,11 @@ async def main():
 
     generate_map()
 
-    async with websockets.serve(game_handler, "localhost", 6789):
+    threading.Thread(target=start_http_server, daemon=True).start()
+
+    async with websockets.serve(game_handler, "localhost", PORT):
         asyncio.create_task(game_state_sender())
-        print("Server started on ws://localhost:6789")
+        print(f"Server started on ws://localhost:{PORT}")
         await asyncio.Future()
 
 if __name__ == "__main__":
