@@ -48,6 +48,56 @@ let reconnectAttempts = 0;
 let lastDirectionUpdate = 0;
 let alive = false;
 
+const uiOverlay = document.createElement('div');
+uiOverlay.id = 'uiOverlay';
+uiOverlay.style.position = 'absolute';
+uiOverlay.style.top = '0';
+uiOverlay.style.left = '0';
+uiOverlay.style.width = '100%';
+uiOverlay.style.height = '100%';
+uiOverlay.style.display = 'none';
+uiOverlay.style.backgroundColor = 'rgba(0,0,0,0.7)';
+uiOverlay.style.zIndex = '9999';
+uiOverlay.style.justifyContent = 'center';
+uiOverlay.style.alignItems = 'center';
+uiOverlay.style.flexDirection = 'column';
+uiOverlay.style.fontFamily = 'Arial, sans-serif';
+uiOverlay.style.color = '#fff';
+uiOverlay.style.fontSize = '24px';
+
+const uiMessage = document.createElement('div');
+uiMessage.style.textAlign = 'center';
+uiMessage.style.marginBottom = '20px';
+uiOverlay.appendChild(uiMessage);
+
+const uiButton = document.createElement('button');
+uiButton.style.padding = '10px 20px';
+uiButton.style.fontSize = '18px';
+uiButton.style.border = 'none';
+uiButton.style.borderRadius = '5px';
+uiButton.style.backgroundColor = '#4CAF50';
+uiButton.style.color = '#fff';
+uiButton.style.cursor = 'pointer';
+uiButton.style.display = 'none';
+uiOverlay.appendChild(uiButton);
+
+document.body.appendChild(uiOverlay);
+
+function showUIOverlay(message, showPlayAgain) {
+    uiOverlay.style.display = 'flex';
+    uiMessage.textContent = message;
+    if (showPlayAgain) {
+        uiButton.textContent = 'Play Again';
+        uiButton.style.display = 'inline-block';
+    } else {
+        uiButton.style.display = 'none';
+    }
+}
+
+function hideUIOverlay() {
+    uiOverlay.style.display = 'none';
+}
+
 function connect() {
     socket = new WebSocket('ws://localhost:6789');
 
@@ -68,33 +118,38 @@ function connect() {
         if (data.map) mapData = data.map;
         if (data.tile_size) tileSize = data.tile_size;
         player = players.find(p => p.name === name);
-        
+
         if (player && alive == false) {
             alive = true;
+            hideUIOverlay();
         } else if (alive == true && !player) {
             alive = false
-            alert("You lose!");
+            showUIOverlay("You have been eliminated!", false);
         }
-
 
         if (data.game_over) {
-            // If player not alive or no health or player['health'] <=0 was handled
-            // Check if player name == winner_name
             if (data.winner_name) {
                 if (player && player.name === data.winner_name) {
-                    // Display "You Win" message
-                    alert('You Win!');
+                    showUIOverlay("You Win!", false);
                 } else {
-                    // Player is eliminated or not winner
-                    alert('You have been eliminated!');
+                    showUIOverlay("You have been eliminated!", false);
                 }
             } else {
-                // No winner means player is also out
-                alert('You have been eliminated!');
+                showUIOverlay("You have been eliminated!", false);
             }
-            // Possibly stop the game loop or do nothing since the simulation ends
+        }
+
+        if (data.game_over && data.ask_play_again) {
+            // Show a more stylish prompt on the overlay instead of confirm
+            showUIOverlay("Game Over! Play again?", true);
         }
     };
+
+    /* On play again button click, send the message and hide overlay */
+    uiButton.addEventListener('click', () => {
+        socket.send(JSON.stringify({ type: 'play_again' }));
+        hideUIOverlay();
+    });
 
 
     

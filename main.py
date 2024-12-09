@@ -14,7 +14,7 @@ import os
 # Game settings
 WORLD_SIZE = 2000
 FOOD_COUNT = 3000
-AI_PLAYER_COUNT = 5
+AI_PLAYER_COUNT = 10
 OBSTACLE_COUNT = 0
 
 players = {}         # {name: player_data}
@@ -32,6 +32,7 @@ MAP_WIDTH = WORLD_SIZE // TILE_SIZE
 MAP_HEIGHT = WORLD_SIZE // TILE_SIZE
 terrain_types = ['grass', 'dirt', 'sand', 'rock', 'woods', 'water']
 map_data = []
+game_over = False
 
 def calculate_mass(size):
     return size ** 0.1
@@ -133,6 +134,7 @@ async def unregister_player(websocket):
 
 
 async def game_handler(websocket):
+    global game_over
     await register_player(websocket)
     try:
         async for message in websocket:
@@ -173,8 +175,37 @@ async def game_handler(websocket):
                     'size': 5,
                 }
                 fireballs.append(fireball)
+            elif data['type'] == 'play_again':
+                print('playing again')
+                game_over = False
+                initialize_game(fresh=True)
     finally:
         await unregister_player(websocket)
+
+def initialize_game(fresh=False):
+    # Clears or sets up all globals as at initial start.
+    players.clear()
+    ai_players.clear()
+    food_items.clear()
+    fireballs.clear()
+    explosions.clear()
+    map_data.clear()
+
+    if fresh:
+        # If fresh is True, do not load from file, create a brand new environment
+        # Create AI players fresh
+        for _ in range(AI_PLAYER_COUNT):
+            ai_players.append(generate_ai_player())
+    else:
+        # If not fresh, attempt to load game state or fallback to fresh if none
+        try:
+            load_game_state()
+        except:
+            # If load fails, do fresh start
+            for _ in range(AI_PLAYER_COUNT):
+                ai_players.append(generate_ai_player())
+
+    generate_map()
 
 # In the move_player() function, remove all references to vx, vy, steering, friction, and overshoot checks.
 # Instead, directly move the player towards the target up to max_speed per update.
@@ -619,16 +650,17 @@ def generate_map():
             map_data.append(row)
 
 async def game_state_sender():
-    global lastSaveTime
+    global lastSaveTime, game_over
     while True:
-        update_ai_players()
-        for player in list(players.values()) + ai_players:
-            move_player(player)
-            handle_food_collision(player)
-            handle_world_bounds(player)
+        if game_over is False:
+            update_ai_players()
+            for player in list(players.values()) + ai_players:
+                move_player(player)
+                handle_food_collision(player)
+                handle_world_bounds(player)
 
-        update_food_positions()
-        update_fireballs()
+            update_food_positions()
+            update_fireballs()
 
         
         game_state = {
@@ -663,6 +695,11 @@ async def game_state_sender():
         game_state['game_over'] = game_over
         game_state['winner_name'] = winner
 
+        if game_over:
+            game_state['ask_play_again'] = True
+        else:
+            game_state['ask_play_again'] = False
+
         message = json.dumps(game_state)
 
         if websockets_map:
@@ -674,8 +711,6 @@ async def game_state_sender():
             save_game_state()
             lastSaveTime = current_time
 
-        if game_over == True:
-            quit()
         await asyncio.sleep(0.05)
 
 class PublicHTTPRequestHandler(SimpleHTTPRequestHandler):
