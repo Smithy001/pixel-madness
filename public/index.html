@@ -151,10 +151,6 @@ function connect() {
         hideUIOverlay();
     });
 
-
-    
-
-
     socket.onclose = function() {
         console.log('Disconnected from server. Attempting to reconnect...');
         setTimeout(function() {
